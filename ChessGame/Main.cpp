@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <iostream>
+#include <stack>
 
 constexpr int BOARD_SIZE = 8;
 constexpr int TILE_SIZE = 80;
@@ -36,6 +37,13 @@ struct Vector2Int {
     bool operator!=(const Vector2Int& other) const {
         return !(*this == other);
     }
+};
+
+class Command {
+public:
+    virtual ~Command() = default;
+    virtual void Execute() = 0;
+    virtual void Undo() = 0;
 };
 
 class Piece {
@@ -285,10 +293,54 @@ public:
         Stalemate
     };
 
+    
+    class MoveCommand : public Command {
+    private:
+        Board& board;
+        Vector2Int from;
+        Vector2Int to;
+        std::unique_ptr<Piece> movedPiece;
+        std::unique_ptr<Piece> capturedPiece;
+        bool wasMoved;
+        bool promotionOccurred;
+        PieceColor previousTurn;
+
+    public:
+        MoveCommand(Board& b, Vector2Int f, Vector2Int t,
+            std::unique_ptr<Piece> moved, std::unique_ptr<Piece> captured,
+            bool movedStatus, bool promoted, PieceColor turn)
+            : board(b), from(f), to(t), movedPiece(std::move(moved)),
+            capturedPiece(std::move(captured)), wasMoved(movedStatus),
+            promotionOccurred(promoted), previousTurn(turn) {}
+
+        void Execute() override {
+            
+        }
+
+        void Undo() override {
+            
+            board.squares[from.y][from.x] = std::move(movedPiece);
+            board.squares[from.y][from.x]->boardPosition = from;
+            board.squares[from.y][from.x]->hasMoved = wasMoved;
+
+            
+            board.squares[to.y][to.x] = std::move(capturedPiece);
+            if (board.squares[to.y][to.x]) {
+                board.squares[to.y][to.x]->boardPosition = to;
+            }
+
+            
+            board.currentTurn = previousTurn;
+            board.gameOver = false;
+            board.winner = PieceColor::None;
+        }
+    };
+
     std::vector<std::vector<std::unique_ptr<Piece>>> squares;
     PieceColor currentTurn;
     bool gameOver;
     PieceColor winner;
+    std::stack<std::unique_ptr<Command>> history;
 
     Board() : currentTurn(PieceColor::White), gameOver(false), winner(PieceColor::None) {
         squares.resize(BOARD_SIZE);
@@ -301,6 +353,8 @@ public:
     Board& operator=(const Board&) = delete;
 
     void Initialize() {
+        
+
         
         for (int i = 0; i < BOARD_SIZE; ++i) {
             squares[1][i] = PieceFactory::CreatePiece(PieceType::Pawn, PieceColor::Black, Vector2Int(i, 1));
@@ -411,10 +465,18 @@ public:
         if (!moveLegal) return MoveResult::Invalid;
 
         
+        bool wasMoved = piece->hasMoved;
+        std::unique_ptr<Piece> movedPieceCopy = piece->Clone();
+        std::unique_ptr<Piece> capturedPiece = nullptr;
+        if (squares[to.y][to.x]) {
+            capturedPiece = squares[to.y][to.x]->Clone();
+        }
+        PieceColor previousTurn = currentTurn;
+
+        
         std::unique_ptr<Piece> originalTarget = std::move(squares[to.y][to.x]);
         Vector2Int originalPos = piece->boardPosition;
 
-        
         piece->boardPosition = to;
         piece->hasMoved = true;
         bool isPromotion = piece->IsPromotion();
@@ -428,7 +490,7 @@ public:
         }
 
         
-        if (IsInCheck(currentTurn)) {
+        if (IsInCheck(previousTurn)) {
             
             squares[from.y][from.x] = std::move(squares[to.y][to.x]);
             squares[from.y][from.x]->boardPosition = originalPos;
@@ -438,6 +500,13 @@ public:
 
         
         currentTurn = (currentTurn == PieceColor::White) ? PieceColor::Black : PieceColor::White;
+
+        
+        bool promotionOccurred = isPromotion;
+        history.push(std::make_unique<MoveCommand>(*this, from, to,
+            std::move(movedPieceCopy),
+            std::move(capturedPiece),
+            wasMoved, promotionOccurred, previousTurn));
 
         
         bool inCheck = IsInCheck(currentTurn);
@@ -458,6 +527,18 @@ public:
         }
 
         return MoveResult::Success;
+    }
+
+    bool UndoLastMove() {
+        if (history.empty()) {
+            return false;
+        }
+
+        auto& command = history.top();
+        command->Undo();
+        history.pop();
+
+        return true;
     }
 
     void HandlePromotion(Vector2Int pos) {
@@ -483,14 +564,23 @@ public:
 
     void Init() {
         board.Initialize();
+
+        
         Image spriteImage = LoadImage("chess_pieces.png");
-        spriteSheet = LoadTextureFromImage(spriteImage);
-        UnloadImage(spriteImage);
+        if (spriteImage.data != nullptr) {
+            spriteSheet = LoadTextureFromImage(spriteImage);
+            UnloadImage(spriteImage);
+        }
+        else {
+            
+            TraceLog(LOG_WARNING, "Failed to load chess pieces image!");
+        }
     }
 
     void Update() {
         statusMessage = "";
 
+        
         if (board.gameOver) {
             if (board.winner == PieceColor::None) {
                 statusMessage = "Stalemate! Game ended in a draw.";
@@ -503,6 +593,20 @@ public:
             return;
         }
 
+        
+        if (IsKeyPressed(KEY_U)) {
+            if (board.UndoLastMove()) {
+                statusMessage = "Undo successful!";
+                pieceSelected = false;
+                selectedSquare = Vector2Int(-1, -1);
+            }
+            else {
+                statusMessage = "No moves to undo!";
+            }
+            return;
+        }
+
+        
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             int mx = GetMouseX();
             int my = GetMouseY();
@@ -511,6 +615,7 @@ public:
             Vector2Int clickedPos(col, row);
 
             if (!pieceSelected) {
+                
                 Piece* p = board.GetPieceAt(clickedPos);
                 if (p && p->color == board.currentTurn) {
                     selectedSquare = clickedPos;
@@ -518,14 +623,18 @@ public:
                 }
             }
             else {
+                
                 Board::MoveResult result = board.MovePiece(selectedSquare, clickedPos);
+
                 if (result == Board::MoveResult::Success ||
                     result == Board::MoveResult::Check ||
                     result == Board::MoveResult::Checkmate) {
 
+                    
                     pieceSelected = false;
                     selectedSquare = Vector2Int(-1, -1);
 
+                    
                     if (result == Board::MoveResult::Check) {
                         statusMessage = (board.currentTurn == PieceColor::White)
                             ? "White is in check!"
@@ -533,11 +642,14 @@ public:
                     }
                 }
                 else {
+                    
                     if (clickedPos == selectedSquare) {
+                        
                         pieceSelected = false;
                         selectedSquare = Vector2Int(-1, -1);
                     }
                     else {
+                        
                         Piece* p = board.GetPieceAt(clickedPos);
                         if (p && p->color == board.currentTurn) {
                             selectedSquare = clickedPos;
@@ -553,6 +665,7 @@ public:
         DrawBoard();
         DrawPieces();
 
+        
         if (pieceSelected) {
             Rectangle highlight = {
                 (float)(selectedSquare.x * TILE_SIZE),
@@ -563,33 +676,45 @@ public:
             DrawRectangleLinesEx(highlight, 4, GREEN);
         }
 
+        
         std::string turnText = (board.currentTurn == PieceColor::White)
             ? "Turn: White"
             : "Turn: Black";
         DrawText(turnText.c_str(), 10, BOARD_SIZE * TILE_SIZE + 10, 20, BLACK);
 
+        
         if (!statusMessage.empty()) {
+            int textWidth = MeasureText(statusMessage.c_str(), 30);
             DrawText(statusMessage.c_str(),
-                BOARD_SIZE * TILE_SIZE / 2 - MeasureText(statusMessage.c_str(), 30) / 2,
-                BOARD_SIZE * TILE_SIZE + 20, 30, RED);
+                BOARD_SIZE * TILE_SIZE / 2 - textWidth / 2,
+                BOARD_SIZE * TILE_SIZE + 40, 30, RED);
         }
+
+        
+        std::string undoHint = "Press 'U' to Undo";
+        int hintWidth = MeasureText(undoHint.c_str(), 20);
+        DrawText(undoHint.c_str(),
+            BOARD_SIZE * TILE_SIZE - hintWidth - 10,
+            BOARD_SIZE * TILE_SIZE + 10, 20, DARKGRAY);
     }
 
     void DrawBoard() {
-        Color light = { 240, 217, 181, 255 };
-        Color dark = { 181, 136, 99, 255 };
+        Color light = { 240, 217, 181, 255 };    
+        Color dark = { 181, 136, 99, 255 };       
 
         for (int y = 0; y < BOARD_SIZE; ++y) {
             for (int x = 0; x < BOARD_SIZE; ++x) {
                 bool isLight = (x + y) % 2 == 0;
-                DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, isLight ? light : dark);
+                DrawRectangle(x * TILE_SIZE, y * TILE_SIZE,
+                    TILE_SIZE, TILE_SIZE,
+                    isLight ? light : dark);
             }
         }
     }
 
     void DrawPieces() {
-        const int pieceWidth = 56;
-        const int pieceHeight = 60;
+        const int pieceWidth = 56;   
+        const int pieceHeight = 60;  
 
         for (int y = 0; y < BOARD_SIZE; ++y) {
             for (int x = 0; x < BOARD_SIZE; ++x) {
@@ -598,6 +723,7 @@ public:
                     PieceColor c = piecePtr->color;
                     PieceType t = piecePtr->type;
 
+                    
                     int pieceIndex = 0;
                     switch (t) {
                     case PieceType::Rook: pieceIndex = 0; break;
@@ -609,8 +735,10 @@ public:
                     default: pieceIndex = 0; break;
                     }
 
+                    
                     int row = (c == PieceColor::Black) ? 0 : 1;
 
+                    
                     Rectangle sourceRec = {
                         pieceIndex * pieceWidth * 1.0f,
                         row * pieceHeight * 1.0f,
@@ -618,6 +746,7 @@ public:
                         pieceHeight * 1.0f
                     };
 
+                    
                     Rectangle destRec = {
                         x * TILE_SIZE + (TILE_SIZE - pieceWidth) / 2.0f,
                         y * TILE_SIZE + (TILE_SIZE - pieceHeight) / 2.0f,
@@ -625,6 +754,7 @@ public:
                         (float)pieceHeight
                     };
 
+                    
                     DrawTexturePro(spriteSheet, sourceRec, destRec, { 0,0 }, 0.0f, WHITE);
                 }
             }
